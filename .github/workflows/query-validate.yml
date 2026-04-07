@@ -10,14 +10,33 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Validate parser.json against schema
+        run: |
+          npm install --global ajv-cli ajv-formats
+          # Fetch the parserManifest schema from the registry repo
+          curl -sfL https://raw.githubusercontent.com/neovim-treesitter/treesitter-parser-registry/main/schemas/schema.json \
+            -o /tmp/registry-schema.json
+          # Extract just the parserManifest definition into a standalone schema
+          jq '{
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$defs": ."$defs",
+            "$ref": "#/$defs/parserManifest"
+          }' /tmp/registry-schema.json > /tmp/parser-manifest-schema.json
+          ajv validate \
+            --spec=draft2020 \
+            --strict=false \
+            -c ajv-formats \
+            -s /tmp/parser-manifest-schema.json \
+            -d parser.json
+
       - name: Read parser manifest
         id: manifest
         run: |
-          echo "lang=$(jq -r '.lang // ""' parser.json)"                     >> "$GITHUB_OUTPUT"
-          echo "url=$(jq -r '.url // ""' parser.json)"                       >> "$GITHUB_OUTPUT"
-          echo "min_version=$(jq -r '.min_version // "HEAD"' parser.json)"   >> "$GITHUB_OUTPUT"
-          echo "location=$(jq -r '.location // ""' parser.json)"             >> "$GITHUB_OUTPUT"
-          echo "queries_only=$(jq -r '.queries_only // false' parser.json)"  >> "$GITHUB_OUTPUT"
+          echo "lang=$(jq -r '.lang // ""' parser.json)"                       >> "$GITHUB_OUTPUT"
+          echo "url=$(jq -r '.url // ""' parser.json)"                         >> "$GITHUB_OUTPUT"
+          echo "parser_version=$(jq -r '.parser_version // "HEAD"' parser.json)" >> "$GITHUB_OUTPUT"
+          echo "location=$(jq -r '.location // ""' parser.json)"               >> "$GITHUB_OUTPUT"
+          echo "queries_only=$(jq -r '.queries_only // false' parser.json)"    >> "$GITHUB_OUTPUT"
 
       - name: Install tree-sitter CLI
         uses: tree-sitter/setup-action/cli@v2
@@ -26,7 +45,7 @@ jobs:
         if: steps.manifest.outputs.queries_only != 'true' && steps.manifest.outputs.url != ''
         env:
           URL:      ${{ steps.manifest.outputs.url }}
-          REF:      ${{ steps.manifest.outputs.min_version }}
+          REF:      ${{ steps.manifest.outputs.parser_version }}
           LOCATION: ${{ steps.manifest.outputs.location }}
           LANG:     ${{ steps.manifest.outputs.lang }}
         run: |
@@ -72,7 +91,7 @@ jobs:
             local PJSON PURL PREF PLOC
             PJSON=$(curl -sfL "${RAW_BASE}/parser.json" 2>/dev/null || echo '{}')
             PURL=$(echo "$PJSON" | jq -r '.url // ""')
-            PREF=$(echo "$PJSON" | jq -r '.min_version // "HEAD"')
+            PREF=$(echo "$PJSON" | jq -r '.parser_version // "HEAD"')
             PLOC=$(echo "$PJSON" | jq -r '.location // ""')
 
             if [ -n "$PURL" ]; then
@@ -130,6 +149,33 @@ jobs:
 
       - name: Check queries
         run: ./ts_query_ls check queries/
+
+      - name: Install highlight-assertions
+        if: ${{ hashFiles('tests/highlights/**/*') != '' }}
+        run: |
+          curl -fL https://github.com/nvim-treesitter/highlight-assertions/releases/latest/download/highlight-assertions-x86_64-unknown-linux-gnu.tar.gz \
+            | tar -xz -C /tmp
+
+      - name: Run highlight tests
+        if: ${{ hashFiles('tests/highlights/**/*') != '' }}
+        env:
+          LANG: ${{ steps.manifest.outputs.lang }}
+        run: |
+          ERRORS=0
+          for FILE in tests/highlights/*; do
+            [ -f "$FILE" ] || continue
+            echo "==> $FILE"
+            if ! /tmp/highlight-assertions \
+                --parser-dir /tmp/ts-parsers \
+                --lang "$LANG" \
+                "$FILE"; then
+              ERRORS=$((ERRORS + 1))
+            fi
+          done
+          if [ "$ERRORS" -gt 0 ]; then
+            echo "::error::$ERRORS highlight test file(s) failed"
+            exit 1
+          fi
 
       - name: Run corpus tests
         if: ${{ hashFiles('test/corpus/*.txt') != '' }}
