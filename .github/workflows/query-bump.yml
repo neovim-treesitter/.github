@@ -2,6 +2,7 @@ name: Bump Parser Version
 
 on:
   workflow_call:
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -12,7 +13,7 @@ jobs:
     name: Check for parser update
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Read parser manifest
         id: manifest
@@ -205,13 +206,18 @@ jobs:
         env:
           LANG: ${{ steps.manifest.outputs.lang }}
         run: |
-          curl -fL https://github.com/nomis/tree-sitter-highlight-assertions/releases/latest/download/highlight-assertions-x86_64-unknown-linux-gnu.tar.gz \
-            | tar -xz
-          ./highlight-assertions \
-            --parser-dir /tmp/ts-parsers \
-            --query-dir queries \
-            --lang "$LANG" \
-            tests/highlights/
+          curl -fL https://github.com/nvim-treesitter/highlight-assertions/releases/latest/download/highlight-assertions-x86_64-unknown-linux-gnu.tar.gz \
+            | tar -xz -C /tmp
+          ERRORS=0
+          for FILE in tests/highlights/*; do
+            [ -f "$FILE" ] || continue
+            if ! /tmp/highlight-assertions \
+                --parser-file "/tmp/ts-parsers/${LANG}.so" \
+                --source-file "$FILE"; then
+              ERRORS=$((ERRORS + 1))
+            fi
+          done
+          [ "$ERRORS" -eq 0 ] || exit 1
 
       - name: Create bump PR
         if: steps.discover.outputs.needs_bump == 'true'

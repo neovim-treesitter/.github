@@ -2,6 +2,7 @@ name: Validate Queries
 
 on:
   workflow_call:
+  workflow_dispatch:
 
 jobs:
   validate:
