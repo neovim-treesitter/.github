@@ -34,11 +34,13 @@ jobs:
         id: manifest
         run: |
           echo "lang=$(jq -r '.lang // ""' parser.json)"                       >> "$GITHUB_OUTPUT"
-          echo "url=$(jq -r '.url // ""' parser.json)"                         >> "$GITHUB_OUTPUT"
+          echo "url=$(jq -r '.url // "" | sub("\\.git$"; "")' parser.json)"    >> "$GITHUB_OUTPUT"
           echo "parser_version=$(jq -r '.parser_version // "HEAD"' parser.json)" >> "$GITHUB_OUTPUT"
           echo "location=$(jq -r '.location // ""' parser.json)"               >> "$GITHUB_OUTPUT"
           echo "queries_only=$(jq -r '.queries_only // false' parser.json)"    >> "$GITHUB_OUTPUT"
-          echo "host_parser_url=$(jq -r '.host_parser.url // ""' parser.json)" >> "$GITHUB_OUTPUT"
+          echo "generate=$(jq -r '.generate // false' parser.json)"            >> "$GITHUB_OUTPUT"
+          echo "generate_from_json=$(jq -r '.generate_from_json // false' parser.json)" >> "$GITHUB_OUTPUT"
+          echo "host_parser_url=$(jq -r '.host_parser.url // "" | sub("\\.git$"; "")' parser.json)" >> "$GITHUB_OUTPUT"
           echo "host_parser_version=$(jq -r '.host_parser.parser_version // "HEAD"' parser.json)" >> "$GITHUB_OUTPUT"
           echo "host_parser_location=$(jq -r '.host_parser.location // ""' parser.json)" >> "$GITHUB_OUTPUT"
           echo "host_parser_lang=$(jq -r '.host_parser.lang // ""' parser.json)" >> "$GITHUB_OUTPUT"
@@ -49,16 +51,27 @@ jobs:
       - name: Build parser
         if: steps.manifest.outputs.queries_only != 'true' && steps.manifest.outputs.url != ''
         env:
-          URL:      ${{ steps.manifest.outputs.url }}
-          REF:      ${{ steps.manifest.outputs.parser_version }}
-          LOCATION: ${{ steps.manifest.outputs.location }}
-          LANG:     ${{ steps.manifest.outputs.lang }}
+          URL:               ${{ steps.manifest.outputs.url }}
+          REF:               ${{ steps.manifest.outputs.parser_version }}
+          LOCATION:          ${{ steps.manifest.outputs.location }}
+          LANG:              ${{ steps.manifest.outputs.lang }}
+          NEEDS_GENERATE:    ${{ steps.manifest.outputs.generate }}
+          GENERATE_FROM_JSON: ${{ steps.manifest.outputs.generate_from_json }}
         run: |
           curl -sL "$URL/archive/$REF.tar.gz" -o parser.tar.gz
           # Detect the actual extracted dir name from the archive (handles HEAD, branch names, semver)
           SRC=$(tar -tf parser.tar.gz 2>/dev/null | head -1 | cut -d/ -f1 || true)
           tar -xzf parser.tar.gz
           [ -n "$LOCATION" ] && SRC="$SRC/$LOCATION"
+          # Some parsers need tree-sitter generate before building
+          if [ "$NEEDS_GENERATE" = "true" ]; then
+            if [ "$GENERATE_FROM_JSON" = "true" ]; then
+              tree-sitter generate "$SRC/src/grammar.json"
+            else
+              npm install --prefix "$SRC" 2>/dev/null || true
+              tree-sitter generate "$SRC/grammar.js"
+            fi
+          fi
           mkdir -p /tmp/ts-parsers
           tree-sitter build --output "/tmp/ts-parsers/${LANG}.so" "$SRC"
 
