@@ -24,6 +24,9 @@ jobs:
           echo "parser_version=$(jq -r '.parser_version // ""' parser.json)"     >> "$GITHUB_OUTPUT"
           echo "location=$(jq -r '.location // ""' parser.json)"                 >> "$GITHUB_OUTPUT"
           echo "queries_only=$(jq -r '.queries_only // false' parser.json)"      >> "$GITHUB_OUTPUT"
+          echo "host_parser_url=$(jq -r '.host_parser.url // ""' parser.json)"   >> "$GITHUB_OUTPUT"
+          echo "host_parser_version=$(jq -r '.host_parser.parser_version // "HEAD"' parser.json)" >> "$GITHUB_OUTPUT"
+          echo "host_parser_location=$(jq -r '.host_parser.location // ""' parser.json)" >> "$GITHUB_OUTPUT"
 
       - name: Skip if queries_only
         if: steps.manifest.outputs.queries_only == 'true'
@@ -108,6 +111,49 @@ jobs:
           [ -n "$LOCATION" ] && SRC="$SRC/$LOCATION"
           mkdir -p /tmp/ts-parsers
           tree-sitter build --output "/tmp/ts-parsers/${LANG}.so" "$SRC"
+
+      - name: Build host parser (queries_only)
+        if: steps.manifest.outputs.queries_only == 'true' && steps.manifest.outputs.host_parser_url != ''
+        env:
+          HOST_URL:  ${{ steps.manifest.outputs.host_parser_url }}
+          HOST_REF:  ${{ steps.manifest.outputs.host_parser_version }}
+          HOST_LOC:  ${{ steps.manifest.outputs.host_parser_location }}
+          LANG:      ${{ steps.manifest.outputs.lang }}
+        run: |
+          REF="${HOST_REF:-HEAD}"
+          curl -sL "$HOST_URL/archive/$REF.tar.gz" -o host-parser.tar.gz
+          SRC=$(tar -tf host-parser.tar.gz 2>/dev/null | head -1 | cut -d/ -f1 || true)
+          tar -xzf host-parser.tar.gz
+          [ -n "$HOST_LOC" ] && SRC="$SRC/$HOST_LOC"
+          mkdir -p /tmp/ts-parsers
+          tree-sitter build --output "/tmp/ts-parsers/${LANG}.so" "$SRC"
+
+      - name: Install injection dep parsers
+        if: steps.discover.outputs.needs_bump == 'true' || steps.manifest.outputs.queries_only == 'true'
+        shell: bash
+        run: |
+          DEPS=$(jq -r '.inject_deps // [] | .[]' parser.json)
+          [ -z "$DEPS" ] && exit 0
+          mkdir -p /tmp/ts-parsers
+          for DEP in $DEPS; do
+            [ -f "/tmp/ts-parsers/${DEP}.so" ] && continue
+            echo "==> Building injection dep: $DEP"
+            RAW="https://raw.githubusercontent.com/neovim-treesitter/nvim-treesitter-queries-${DEP}/main"
+            PJSON=$(curl -sfL "${RAW}/parser.json" 2>/dev/null || echo '{}')
+            PURL=$(echo "$PJSON" | jq -r '.url // ""')
+            PREF=$(echo "$PJSON" | jq -r '.parser_version // "HEAD"')
+            PLOC=$(echo "$PJSON" | jq -r '.location // ""')
+            if [ -n "$PURL" ]; then
+              curl -sL "${PURL}/archive/${PREF}.tar.gz" -o "dep-${DEP}.tar.gz"
+              PSRC=$(tar -tf "dep-${DEP}.tar.gz" 2>/dev/null | head -1 | cut -d/ -f1 || true)
+              tar -xzf "dep-${DEP}.tar.gz"
+              [ -n "$PLOC" ] && PSRC="$PSRC/$PLOC"
+              tree-sitter build --output "/tmp/ts-parsers/${DEP}.so" "$PSRC" \
+                || echo "WARN: failed to build parser for $DEP"
+            else
+              echo "  skipping $DEP (no parser URL — may be queries-only)"
+            fi
+          done
 
       - name: Resolve inherited query dependencies
         if: steps.discover.outputs.needs_bump == 'true'
