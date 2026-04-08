@@ -116,12 +116,14 @@ jobs:
           [ -n "$LOCATION" ] && SRC="$SRC/$LOCATION"
           # Some parsers need tree-sitter generate before building
           if [ "$NEEDS_GENERATE" = "true" ]; then
+            pushd "$SRC"
             if [ "$GENERATE_FROM_JSON" = "true" ]; then
-              tree-sitter generate "$SRC/src/grammar.json"
+              tree-sitter generate src/grammar.json
             else
-              npm install --prefix "$SRC" 2>/dev/null || true
-              tree-sitter generate "$SRC/grammar.js"
+              npm install 2>/dev/null || true
+              tree-sitter generate
             fi
+            popd
           fi
           mkdir -p /tmp/ts-parsers
           tree-sitter build --output "/tmp/ts-parsers/${LANG}.so" "$SRC"
