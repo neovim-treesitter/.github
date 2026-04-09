@@ -1,0 +1,296 @@
+name: Validate Self-Contained Queries
+
+on:
+  workflow_call:
+    inputs:
+      lang:
+        description: >
+          Language name (e.g. 'zsh', 'rust'). Must match the subdirectory name
+          under queries_dir if queries_dir is used.
+        required: true
+        type: string
+      queries-path:
+        description: >
+          Path relative to repo root of the directory containing .scm files
+          directly (e.g. 'queries/nvim'). Use when the query dir does NOT
+          follow the <dir>/<lang>/ pattern.
+          Mutually exclusive with queries-dir.
+        required: false
+        type: string
+        default: ''
+      queries-dir:
+        description: >
+          Path relative to repo root of the parent directory whose <lang>/
+          subdirectory contains the .scm files (e.g. 'nvim-queries').
+          The workflow appends /<lang> automatically.
+          Mutually exclusive with queries-path.
+        required: false
+        type: string
+        default: ''
+      parser-location:
+        description: >
+          Subdirectory within the repo that contains the parser source.
+          Leave empty if the parser is at the repo root.
+        required: false
+        type: string
+        default: ''
+      inject-deps:
+        description: >
+          Comma-separated list of languages whose parsers are needed for
+          injection query validation (e.g. 'html,css').
+        required: false
+        type: string
+        default: ''
+      inherits:
+        description: >
+          Comma-separated list of languages whose queries this language
+          inherits from via '; inherits:' directives. The workflow fetches
+          their query repos and builds their parsers automatically.
+        required: false
+        type: string
+        default: ''
+  workflow_dispatch:
+    inputs:
+      lang:
+        description: Language name
+        required: true
+        type: string
+      queries-path:
+        description: Direct path to .scm files
+        required: false
+        type: string
+        default: ''
+      queries-dir:
+        description: Parent dir of <lang>/ query subdirectory
+        required: false
+        type: string
+        default: ''
+      parser-location:
+        description: Parser source subdirectory
+        required: false
+        type: string
+        default: ''
+      inject-deps:
+        description: Comma-separated injection dependency languages
+        required: false
+        type: string
+        default: ''
+      inherits:
+        description: Comma-separated inherited languages
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve query directory
+        id: queries
+        shell: bash
+        env:
+          LANG:         ${{ inputs.lang }}
+          QUERIES_PATH: ${{ inputs.queries-path }}
+          QUERIES_DIR:  ${{ inputs.queries-dir }}
+        run: |
+          if [ -n "$QUERIES_PATH" ] && [ -n "$QUERIES_DIR" ]; then
+            echo "::error::Set queries-path OR queries-dir, not both"
+            exit 1
+          fi
+          if [ -n "$QUERIES_PATH" ]; then
+            DIR="$QUERIES_PATH"
+          elif [ -n "$QUERIES_DIR" ]; then
+            DIR="${QUERIES_DIR}/${LANG}"
+          else
+            echo "::error::One of queries-path or queries-dir must be set"
+            exit 1
+          fi
+          if [ ! -d "$DIR" ]; then
+            echo "::error::Query directory does not exist: $DIR"
+            exit 1
+          fi
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+          echo "==> Query directory: $DIR"
+
+      - name: Install tree-sitter CLI
+        uses: tree-sitter/setup-action/cli@v2
+
+      - name: Build parser
+        shell: bash
+        env:
+          LOCATION: ${{ inputs.parser-location }}
+        run: |
+          SRC="."
+          [ -n "$LOCATION" ] && SRC="$LOCATION"
+          mkdir -p /tmp/ts-parsers
+          tree-sitter build --output "/tmp/ts-parsers/${{ inputs.lang }}.so" "$SRC"
+
+      - name: Build injection dependency parsers
+        if: inputs.inject-deps != ''
+        shell: bash
+        env:
+          DEPS: ${{ inputs.inject-deps }}
+        run: |
+          mkdir -p /tmp/ts-parsers
+          IFS=',' read -ra DEP_LIST <<< "$DEPS"
+          for DEP in "${DEP_LIST[@]}"; do
+            DEP=$(echo "$DEP" | xargs)  # trim whitespace
+            [ -z "$DEP" ] && continue
+            [ -f "/tmp/ts-parsers/${DEP}.so" ] && continue
+            echo "==> Building injection dep: $DEP"
+            RAW="https://raw.githubusercontent.com/neovim-treesitter/nvim-treesitter-queries-${DEP}/main"
+            PJSON=$(curl -sfL "${RAW}/parser.json" 2>/dev/null || echo '{}')
+            PURL=$(echo "$PJSON" | jq -r '.url // ""')
+            PREF=$(echo "$PJSON" | jq -r '.parser_version // "HEAD"')
+            PLOC=$(echo "$PJSON" | jq -r '.location // ""')
+            if [ -n "$PURL" ]; then
+              curl -sL "${PURL}/archive/${PREF}.tar.gz" -o "dep-${DEP}.tar.gz"
+              PSRC=$(tar -tf "dep-${DEP}.tar.gz" 2>/dev/null | head -1 | cut -d/ -f1 || true)
+              tar -xzf "dep-${DEP}.tar.gz"
+              [ -n "$PLOC" ] && PSRC="$PSRC/$PLOC"
+              tree-sitter build --output "/tmp/ts-parsers/${DEP}.so" "$PSRC" \
+                || echo "WARN: failed to build parser for $DEP"
+            else
+              echo "  skipping $DEP (no parser URL)"
+            fi
+          done
+
+      - name: Resolve inherited query dependencies
+        if: inputs.inherits != ''
+        shell: bash
+        env:
+          INHERITS:   ${{ inputs.inherits }}
+          QUERY_DIR:  ${{ steps.queries.outputs.dir }}
+        run: |
+          mkdir -p /tmp/ts-parsers query-deps
+
+          fetch_lang() {
+            local LANG="$1"
+            local ORG="neovim-treesitter"
+            local REPO_NAME="nvim-treesitter-queries-${LANG}"
+            local RAW_BASE="https://raw.githubusercontent.com/${ORG}/${REPO_NAME}/main"
+            local API_BASE="https://api.github.com/repos/${ORG}/${REPO_NAME}"
+
+            echo "==> Fetching dependency: $LANG"
+            mkdir -p "query-deps/${LANG}"
+
+            local FILES
+            FILES=$(curl -sfL "${API_BASE}/contents/queries" \
+              -H "Accept: application/vnd.github+json" \
+              | jq -r '.[].name' 2>/dev/null || true)
+
+            for FNAME in $FILES; do
+              curl -sfL "${RAW_BASE}/queries/${FNAME}" \
+                -o "query-deps/${LANG}/${FNAME}" || true
+            done
+            echo "  downloaded $(ls query-deps/${LANG}/ 2>/dev/null | wc -l) query files for ${LANG}"
+
+            local PJSON PURL PREF PLOC
+            PJSON=$(curl -sfL "${RAW_BASE}/parser.json" 2>/dev/null || echo '{}')
+            PURL=$(echo "$PJSON" | jq -r '.url // ""')
+            PREF=$(echo "$PJSON" | jq -r '.parser_version // "HEAD"')
+            PLOC=$(echo "$PJSON" | jq -r '.location // ""')
+
+            if [ -n "$PURL" ] && [ ! -f "/tmp/ts-parsers/${LANG}.so" ]; then
+              curl -sL "${PURL}/archive/${PREF}.tar.gz" -o "dep-${LANG}.tar.gz"
+              local PSRC
+              PSRC=$(tar -tf "dep-${LANG}.tar.gz" 2>/dev/null | head -1 | cut -d/ -f1 || true)
+              tar -xzf "dep-${LANG}.tar.gz"
+              [ -n "$PLOC" ] && PSRC="$PSRC/$PLOC"
+              tree-sitter build --output "/tmp/ts-parsers/${LANG}.so" "$PSRC" \
+                || echo "WARN: failed to build parser for $LANG"
+            fi
+          }
+
+          # Seed the BFS queue from the explicit inherits input
+          VISITED=""
+          QUEUE=""
+          IFS=',' read -ra INIT_LIST <<< "$INHERITS"
+          for L in "${INIT_LIST[@]}"; do
+            L=$(echo "$L" | xargs)
+            [ -n "$L" ] && QUEUE="$QUEUE $L"
+          done
+
+          # Also scan the query files for ; inherits: directives
+          SCAN=$(grep -rh '^; inherits:' "$QUERY_DIR"/*.scm 2>/dev/null \
+            | sed 's/; inherits: *//' | tr ',' '\n' | sed 's/?$//' \
+            | tr -d ' ' | sort -u | tr '\n' ' ' || true)
+          QUEUE="$QUEUE $SCAN"
+
+          while [ -n "$(echo "$QUEUE" | xargs)" ]; do
+            NEXT_QUEUE=""
+            for DEP in $QUEUE; do
+              case " $VISITED " in *" $DEP "*) continue ;; esac
+              VISITED="$VISITED $DEP"
+              fetch_lang "$DEP"
+              NEW=$(grep -rh '^; inherits:' "query-deps/${DEP}/" 2>/dev/null \
+                | sed 's/; inherits: *//' | tr ',' '\n' | sed 's/?$//' \
+                | tr -d ' ' | sort -u | tr '\n' ' ' || true)
+              NEXT_QUEUE="$NEXT_QUEUE $NEW"
+            done
+            QUEUE="$NEXT_QUEUE"
+          done
+
+      - name: Write .tsqueryrc.json
+        shell: bash
+        env:
+          LANG:      ${{ inputs.lang }}
+          QUERY_DIR: ${{ steps.queries.outputs.dir }}
+        run: |
+          # Build a retrieval pattern from the query dir
+          # e.g. "nvim-queries/zsh/foo.scm" -> "nvim-queries/([^/]+)/[^/]+\.scm$"
+          PARENT_DIR=$(dirname "$QUERY_DIR")
+          PATTERN="${PARENT_DIR}/([^/]+)/[^/]+\\.scm\$"
+          jq -n \
+            --arg pattern "$PATTERN" \
+            '{
+              parser_install_directories: ["/tmp/ts-parsers"],
+              supported_abi_versions: { start: 13, end: 15 },
+              language_retrieval_patterns: [
+                $pattern,
+                "query-deps/([^/]+)/[^/]+\\.scm$"
+              ]
+            }' > .tsqueryrc.json
+          echo "==> .tsqueryrc.json:"
+          cat .tsqueryrc.json
+
+      - name: Install ts_query_ls
+        shell: bash
+        run: |
+          curl -fL https://github.com/ribru17/ts_query_ls/releases/latest/download/ts_query_ls-x86_64-unknown-linux-gnu.tar.gz \
+            | tar -xz
+
+      - name: Check queries
+        shell: bash
+        env:
+          QUERY_DIR: ${{ steps.queries.outputs.dir }}
+        run: ./ts_query_ls check "$QUERY_DIR"
+
+      - name: Install highlight-assertions
+        if: ${{ hashFiles('tests/highlights/**/*') != '' }}
+        run: |
+          curl -fL https://github.com/nvim-treesitter/highlight-assertions/releases/latest/download/highlight-assertions-x86_64-unknown-linux-gnu.tar.gz \
+            | tar -xz -C /tmp
+
+      - name: Run highlight tests
+        if: ${{ hashFiles('tests/highlights/**/*') != '' }}
+        env:
+          LANG: ${{ inputs.lang }}
+        run: |
+          ERRORS=0
+          for FILE in tests/highlights/*; do
+            [ -f "$FILE" ] || continue
+            echo "==> $FILE"
+            if ! /tmp/highlight-assertions \
+                --parser-file "/tmp/ts-parsers/${LANG}.so" \
+                --source-file "$FILE"; then
+              ERRORS=$((ERRORS + 1))
+            fi
+          done
+          if [ "$ERRORS" -gt 0 ]; then
+            echo "::error::$ERRORS highlight test file(s) failed"
+            exit 1
+          fi
