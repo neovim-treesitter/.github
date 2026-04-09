@@ -22,14 +22,7 @@ jobs:
           echo "url=$(jq -r '.url // "" | sub("\\.git$"; "")' parser.json)"      >> "$GITHUB_OUTPUT"
           echo "semver=$(jq -r '.semver // false' parser.json)"                  >> "$GITHUB_OUTPUT"
           echo "parser_version=$(jq -r '.parser_version // ""' parser.json)"     >> "$GITHUB_OUTPUT"
-          echo "location=$(jq -r '.location // ""' parser.json)"                 >> "$GITHUB_OUTPUT"
           echo "queries_only=$(jq -r '.queries_only // false' parser.json)"      >> "$GITHUB_OUTPUT"
-          echo "generate=$(jq -r '.generate // false' parser.json)"              >> "$GITHUB_OUTPUT"
-          echo "generate_from_json=$(jq -r '.generate_from_json // false' parser.json)" >> "$GITHUB_OUTPUT"
-          echo "host_parser_url=$(jq -r '.host_parser.url // "" | sub("\\.git$"; "")' parser.json)" >> "$GITHUB_OUTPUT"
-          echo "host_parser_version=$(jq -r '.host_parser.parser_version // "HEAD"' parser.json)" >> "$GITHUB_OUTPUT"
-          echo "host_parser_location=$(jq -r '.host_parser.location // ""' parser.json)" >> "$GITHUB_OUTPUT"
-          echo "host_parser_lang=$(jq -r '.host_parser.lang // ""' parser.json)" >> "$GITHUB_OUTPUT"
 
       - name: Skip if queries_only
         if: steps.manifest.outputs.queries_only == 'true'
@@ -96,182 +89,12 @@ jobs:
             echo "needs_bump=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Install tree-sitter CLI
+      - name: Setup query environment
         if: steps.discover.outputs.needs_bump == 'true'
-        uses: tree-sitter/setup-action/cli@v2
-
-      - name: Build parser at new version
-        if: steps.discover.outputs.needs_bump == 'true'
-        env:
-          URL:               ${{ steps.manifest.outputs.url }}
-          REF:               ${{ steps.discover.outputs.latest }}
-          LOCATION:          ${{ steps.manifest.outputs.location }}
-          LANG:              ${{ steps.manifest.outputs.lang }}
-          NEEDS_GENERATE:    ${{ steps.manifest.outputs.generate }}
-          GENERATE_FROM_JSON: ${{ steps.manifest.outputs.generate_from_json }}
-        run: |
-          curl -sL "$URL/archive/$REF.tar.gz" -o parser.tar.gz
-          SRC=$(tar -tf parser.tar.gz 2>/dev/null | head -1 | cut -d/ -f1 || true)
-          tar -xzf parser.tar.gz
-          [ -n "$LOCATION" ] && SRC="$SRC/$LOCATION"
-          # Some parsers need tree-sitter generate before building
-          if [ "$NEEDS_GENERATE" = "true" ]; then
-            pushd "$SRC"
-            if [ "$GENERATE_FROM_JSON" = "true" ]; then
-              tree-sitter generate src/grammar.json
-            else
-              npm install 2>/dev/null || true
-              tree-sitter generate
-            fi
-            popd
-          fi
-          mkdir -p /tmp/ts-parsers
-          tree-sitter build --output "/tmp/ts-parsers/${LANG}.so" "$SRC"
-
-      - name: Build host parser (queries_only)
-        if: steps.manifest.outputs.queries_only == 'true' && steps.manifest.outputs.host_parser_url != ''
-        env:
-          HOST_URL:         ${{ steps.manifest.outputs.host_parser_url }}
-          HOST_REF:         ${{ steps.manifest.outputs.host_parser_version }}
-          HOST_LOC:         ${{ steps.manifest.outputs.host_parser_location }}
-          HOST_PARSER_LANG: ${{ steps.manifest.outputs.host_parser_lang }}
-          LANG:             ${{ steps.manifest.outputs.lang }}
-        run: |
-          REF="${HOST_REF:-HEAD}"
-          curl -sL "$HOST_URL/archive/$REF.tar.gz" -o host-parser.tar.gz
-          SRC=$(tar -tf host-parser.tar.gz 2>/dev/null | head -1 | cut -d/ -f1 || true)
-          tar -xzf host-parser.tar.gz
-          [ -n "$HOST_LOC" ] && SRC="$SRC/$HOST_LOC"
-          mkdir -p /tmp/ts-parsers
-          # Name the .so after the host language so the C symbol matches
-          # (e.g. html.so exports tree_sitter_html, not tree_sitter_html_tags)
-          HOST_LANG="${HOST_PARSER_LANG:-$LANG}"
-          tree-sitter build --output "/tmp/ts-parsers/${HOST_LANG}.so" "$SRC"
-
-      - name: Install injection dep parsers
-        if: steps.discover.outputs.needs_bump == 'true' || steps.manifest.outputs.queries_only == 'true'
-        shell: bash
-        run: |
-          DEPS=$(jq -r '.inject_deps // [] | .[]' parser.json)
-          [ -z "$DEPS" ] && exit 0
-          mkdir -p /tmp/ts-parsers
-          for DEP in $DEPS; do
-            [ -f "/tmp/ts-parsers/${DEP}.so" ] && continue
-            echo "==> Building injection dep: $DEP"
-            RAW="https://raw.githubusercontent.com/neovim-treesitter/nvim-treesitter-queries-${DEP}/main"
-            PJSON=$(curl -sfL "${RAW}/parser.json" 2>/dev/null || echo '{}')
-            PURL=$(echo "$PJSON" | jq -r '.url // ""')
-            PREF=$(echo "$PJSON" | jq -r '.parser_version // "HEAD"')
-            PLOC=$(echo "$PJSON" | jq -r '.location // ""')
-            if [ -n "$PURL" ]; then
-              curl -sL "${PURL}/archive/${PREF}.tar.gz" -o "dep-${DEP}.tar.gz"
-              PSRC=$(tar -tf "dep-${DEP}.tar.gz" 2>/dev/null | head -1 | cut -d/ -f1 || true)
-              tar -xzf "dep-${DEP}.tar.gz"
-              [ -n "$PLOC" ] && PSRC="$PSRC/$PLOC"
-              tree-sitter build --output "/tmp/ts-parsers/${DEP}.so" "$PSRC" \
-                || echo "WARN: failed to build parser for $DEP"
-            else
-              echo "  skipping $DEP (no parser URL — may be queries-only)"
-            fi
-          done
-
-      - name: Resolve inherited query dependencies
-        if: steps.discover.outputs.needs_bump == 'true'
-        shell: bash
-        run: |
-          mkdir -p /tmp/ts-parsers query-deps
-
-          fetch_lang() {
-            local LANG="$1"
-            local ORG="neovim-treesitter"
-            local REPO_NAME="nvim-treesitter-queries-${LANG}"
-            local RAW_BASE="https://raw.githubusercontent.com/${ORG}/${REPO_NAME}/main"
-            local API_BASE="https://api.github.com/repos/${ORG}/${REPO_NAME}"
-
-            echo "==> Fetching dependency: $LANG"
-            mkdir -p "query-deps/${LANG}"
-
-            local FILES
-            FILES=$(curl -sfL "${API_BASE}/contents/queries" \
-              -H "Accept: application/vnd.github+json" \
-              | jq -r '.[].name' 2>/dev/null || true)
-
-            for FNAME in $FILES; do
-              curl -sfL "${RAW_BASE}/queries/${FNAME}" \
-                -o "query-deps/${LANG}/${FNAME}" || true
-            done
-
-            local PJSON PURL PREF PLOC
-            PJSON=$(curl -sfL "${RAW_BASE}/parser.json" 2>/dev/null || echo '{}')
-            PURL=$(echo "$PJSON" | jq -r '.url // ""')
-            PREF=$(echo "$PJSON" | jq -r '.parser_version // "HEAD"')
-            PLOC=$(echo "$PJSON" | jq -r '.location // ""')
-
-            if [ -n "$PURL" ]; then
-              curl -sL "${PURL}/archive/${PREF}.tar.gz" -o "dep-${LANG}.tar.gz"
-              local PSRC
-              PSRC=$(tar -tf "dep-${LANG}.tar.gz" 2>/dev/null | head -1 | cut -d/ -f1 || true)
-              tar -xzf "dep-${LANG}.tar.gz"
-              [ -n "$PLOC" ] && PSRC="$PSRC/$PLOC"
-              tree-sitter build --output "/tmp/ts-parsers/${LANG}.so" "$PSRC" \
-                || echo "WARN: failed to build parser for $LANG"
-            fi
-          }
-
-          VISITED=""
-          QUEUE=$(grep -rh '^; inherits:' queries/*.scm 2>/dev/null \
-            | sed 's/; inherits: *//' | tr ',' '\n' | sed 's/?$//' \
-            | tr -d ' ' | sort -u | tr '\n' ' ' || true)
-
-          while [ -n "$QUEUE" ]; do
-            NEXT_QUEUE=""
-            for DEP in $QUEUE; do
-              case " $VISITED " in *" $DEP "*) continue ;; esac
-              VISITED="$VISITED $DEP"
-              fetch_lang "$DEP"
-              NEW=$(grep -rh '^; inherits:' "query-deps/${DEP}/" 2>/dev/null \
-                | sed 's/; inherits: *//' | tr ',' '\n' | sed 's/?$//' \
-                | tr -d ' ' | sort -u | tr '\n' ' ' || true)
-              NEXT_QUEUE="$NEXT_QUEUE $NEW"
-            done
-            QUEUE="$NEXT_QUEUE"
-          done
-
-      - name: Write .tsqueryrc.json
-        if: steps.discover.outputs.needs_bump == 'true'
-        env:
-          LANG:             ${{ steps.manifest.outputs.lang }}
-          HOST_PARSER_LANG: ${{ steps.manifest.outputs.host_parser_lang }}
-        run: |
-          # Build parser_aliases block when host_parser.lang differs from lang
-          ALIASES="{}"
-          if [ -n "$HOST_PARSER_LANG" ] && [ "$HOST_PARSER_LANG" != "$LANG" ]; then
-            ALIASES=$(jq -n --arg lang "$LANG" --arg host "$HOST_PARSER_LANG" \
-              '{($lang): $host}')
-          fi
-          jq -n \
-            --argjson aliases "$ALIASES" \
-            '{
-              parser_install_directories: ["/tmp/ts-parsers"],
-              supported_abi_versions: { start: 13, end: 15 },
-              language_retrieval_patterns: [
-                "nvim-treesitter-queries-([^/]+)/queries/[^/]+\\.scm$",
-                "query-deps/([^/]+)/[^/]+\\.scm$"
-              ]
-            } + if $aliases != {} then { parser_aliases: $aliases } else {} end' \
-            > .tsqueryrc.json
-          echo "==> .tsqueryrc.json:"
-          cat .tsqueryrc.json
-
-      - name: Install ts_query_ls
-        if: steps.discover.outputs.needs_bump == 'true'
-        run: |
-          curl -fL https://github.com/ribru17/ts_query_ls/releases/latest/download/ts_query_ls-x86_64-unknown-linux-gnu.tar.gz \
-            | tar -xz
-
-      - name: Check queries against new parser
-        if: steps.discover.outputs.needs_bump == 'true'
-        run: ./ts_query_ls check queries/
+        id: setup
+        uses: ./.github/actions/setup-query-env
+        with:
+          parser-version-override: ${{ steps.discover.outputs.latest }}
 
       - name: Run corpus tests
         if: steps.discover.outputs.needs_bump == 'true' && hashFiles('test/corpus/*.txt') != ''
@@ -282,8 +105,8 @@ jobs:
       - name: Run highlight tests
         if: steps.discover.outputs.needs_bump == 'true' && hashFiles('tests/highlights/*') != ''
         env:
-          LANG:             ${{ steps.manifest.outputs.lang }}
-          HOST_PARSER_LANG: ${{ steps.manifest.outputs.host_parser_lang }}
+          LANG:             ${{ steps.setup.outputs.lang }}
+          HOST_PARSER_LANG: ${{ steps.setup.outputs.host_parser_lang }}
         run: |
           curl -fL https://github.com/nvim-treesitter/highlight-assertions/releases/latest/download/highlight-assertions-x86_64-unknown-linux-gnu.tar.gz \
             | tar -xz -C /tmp
