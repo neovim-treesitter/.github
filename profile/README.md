@@ -35,10 +35,9 @@ bottleneck. We aim to:
 
 The [treesitter-parser-registry](https://github.com/neovim-treesitter/treesitter-parser-registry)
 is an editor-agnostic catalogue of every known tree-sitter parser and where
-its Neovim queries live. Installers like
-[nvim-treesitter](https://github.com/nvim-treesitter/nvim-treesitter) and
-[ts-install.nvim](https://github.com/lewis6991/ts-install.nvim) read the
-registry to discover parsers and fetch queries.
+its Neovim queries live. The registry is designed to be consumed by any
+installer — [nvim-treesitter](https://github.com/nvim-treesitter/nvim-treesitter)
+is the first consumer, and the schema is open for others to adopt.
 
 Each language has one of these source types:
 
