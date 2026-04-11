@@ -32,7 +32,7 @@ jobs:
 
       - name: Setup query environment
         id: setup
-        uses: ./.github/actions/setup-query-env
+        uses: neovim-treesitter/.github/.github/actions/setup-query-env@main
 
       - name: Install highlight-assertions
         if: ${{ hashFiles('tests/highlights/**/*') != '' }}
