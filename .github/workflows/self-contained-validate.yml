@@ -7,14 +7,17 @@ on:
         description: >
           Language name (e.g. 'zsh', 'rust'). Must match the subdirectory name
           under queries_dir if queries_dir is used.
-        required: true
+          Can also be read from parser.json "lang" field.
+        required: false
         type: string
+        default: ''
       queries-path:
         description: >
           Path relative to repo root of the directory containing .scm files
           directly (e.g. 'queries/nvim'). Use when the query dir does NOT
           follow the <dir>/<lang>/ pattern.
           Mutually exclusive with queries-dir.
+          Can also be read from parser.json "queries_path" field.
         required: false
         type: string
         default: ''
@@ -24,6 +27,7 @@ on:
           subdirectory contains the .scm files (e.g. 'nvim-queries').
           The workflow appends /<lang> automatically.
           Mutually exclusive with queries-path.
+          Can also be read from parser.json "queries_dir" field.
         required: false
         type: string
         default: ''
@@ -31,6 +35,7 @@ on:
         description: >
           Subdirectory within the repo that contains the parser source.
           Leave empty if the parser is at the repo root.
+          Can also be read from parser.json "location" field.
         required: false
         type: string
         default: ''
@@ -38,6 +43,7 @@ on:
         description: >
           Comma-separated list of languages whose parsers are needed for
           injection query validation (e.g. 'html,css').
+          Can also be read from parser.json "inject_deps" field.
         required: false
         type: string
         default: ''
@@ -46,6 +52,15 @@ on:
           Comma-separated list of languages whose queries this language
           inherits from via '; inherits:' directives. The workflow fetches
           their query repos and builds their parsers automatically.
+          Can also be read from parser.json "inherits" field.
+        required: false
+        type: string
+        default: ''
+      test-dir:
+        description: >
+          Directory containing highlight assertion test files.
+          Defaults to 'tests/highlights'.
+          Can also be read from parser.json "test_dir" field.
         required: false
         type: string
         default: ''
@@ -53,8 +68,9 @@ on:
     inputs:
       lang:
         description: Language name
-        required: true
+        required: false
         type: string
+        default: ''
       queries-path:
         description: Direct path to .scm files
         required: false
@@ -80,6 +96,11 @@ on:
         required: false
         type: string
         default: ''
+      test-dir:
+        description: Highlight test directory (default tests/highlights)
+        required: false
+        type: string
+        default: ''
 
 jobs:
   validate:
@@ -88,13 +109,93 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # ── Read parser.json for defaults ─────────────────────────────────
+      # Workflow inputs take precedence; parser.json fills in the gaps.
+      - name: Read parser.json defaults
+        id: pjson
+        shell: bash
+        env:
+          IN_LANG:         ${{ inputs.lang }}
+          IN_QUERIES_PATH: ${{ inputs.queries-path }}
+          IN_QUERIES_DIR:  ${{ inputs.queries-dir }}
+          IN_LOCATION:     ${{ inputs.parser-location }}
+          IN_INJECT_DEPS:  ${{ inputs.inject-deps }}
+          IN_INHERITS:     ${{ inputs.inherits }}
+          IN_TEST_DIR:     ${{ inputs.test-dir }}
+        run: |
+          # Parse parser.json if it exists
+          PJ="{}"
+          if [ -f parser.json ]; then
+            PJ=$(cat parser.json)
+            echo "==> Found parser.json"
+          fi
+
+          # Helper: use input if non-empty, else fall back to parser.json field
+          resolve() {
+            local input="$1" field="$2" default="$3"
+            if [ -n "$input" ]; then
+              echo "$input"
+            else
+              local val
+              val=$(echo "$PJ" | jq -r ".$field // \"\"" 2>/dev/null)
+              if [ -n "$val" ]; then
+                echo "$val"
+              else
+                echo "$default"
+              fi
+            fi
+          }
+
+          LANG=$(resolve "$IN_LANG" "lang" "")
+          QUERIES_DIR=$(resolve "$IN_QUERIES_DIR" "queries_dir" "")
+          QUERIES_PATH=$(resolve "$IN_QUERIES_PATH" "queries_path" "")
+          LOCATION=$(resolve "$IN_LOCATION" "location" "")
+          TEST_DIR=$(resolve "$IN_TEST_DIR" "test_dir" "tests/highlights")
+
+          # inject_deps may be an array in JSON — flatten to comma-separated
+          if [ -n "$IN_INJECT_DEPS" ]; then
+            INJECT_DEPS="$IN_INJECT_DEPS"
+          else
+            INJECT_DEPS=$(echo "$PJ" | jq -r '
+              if .inject_deps then
+                (.inject_deps | if type == "array" then join(",") else . end)
+              else ""
+              end' 2>/dev/null)
+          fi
+
+          if [ -n "$IN_INHERITS" ]; then
+            INHERITS="$IN_INHERITS"
+          else
+            INHERITS=$(echo "$PJ" | jq -r '
+              if .inherits then
+                (.inherits | if type == "array" then join(",") else . end)
+              else ""
+              end' 2>/dev/null)
+          fi
+
+          if [ -z "$LANG" ]; then
+            echo "::error::lang is required (set via input or parser.json)"
+            exit 1
+          fi
+
+          echo "lang=$LANG"               >> "$GITHUB_OUTPUT"
+          echo "queries_dir=$QUERIES_DIR"  >> "$GITHUB_OUTPUT"
+          echo "queries_path=$QUERIES_PATH" >> "$GITHUB_OUTPUT"
+          echo "location=$LOCATION"        >> "$GITHUB_OUTPUT"
+          echo "inject_deps=$INJECT_DEPS"  >> "$GITHUB_OUTPUT"
+          echo "inherits=$INHERITS"        >> "$GITHUB_OUTPUT"
+          echo "test_dir=$TEST_DIR"        >> "$GITHUB_OUTPUT"
+
+          echo "==> Resolved: lang=$LANG queries_dir=$QUERIES_DIR queries_path=$QUERIES_PATH"
+          echo "    location=$LOCATION inject_deps=$INJECT_DEPS inherits=$INHERITS test_dir=$TEST_DIR"
+
       - name: Resolve query directory
         id: queries
         shell: bash
         env:
-          LANG:         ${{ inputs.lang }}
-          QUERIES_PATH: ${{ inputs.queries-path }}
-          QUERIES_DIR:  ${{ inputs.queries-dir }}
+          LANG:         ${{ steps.pjson.outputs.lang }}
+          QUERIES_PATH: ${{ steps.pjson.outputs.queries_path }}
+          QUERIES_DIR:  ${{ steps.pjson.outputs.queries_dir }}
         run: |
           if [ -n "$QUERIES_PATH" ] && [ -n "$QUERIES_DIR" ]; then
             echo "::error::Set queries-path OR queries-dir, not both"
@@ -121,18 +222,18 @@ jobs:
       - name: Build parser
         shell: bash
         env:
-          LOCATION: ${{ inputs.parser-location }}
+          LOCATION: ${{ steps.pjson.outputs.location }}
         run: |
           SRC="."
           [ -n "$LOCATION" ] && SRC="$LOCATION"
           mkdir -p /tmp/ts-parsers
-          tree-sitter build --output "/tmp/ts-parsers/${{ inputs.lang }}.so" "$SRC"
+          tree-sitter build --output "/tmp/ts-parsers/${{ steps.pjson.outputs.lang }}.so" "$SRC"
 
       - name: Build injection dependency parsers
-        if: inputs.inject-deps != ''
+        if: steps.pjson.outputs.inject_deps != ''
         shell: bash
         env:
-          DEPS: ${{ inputs.inject-deps }}
+          DEPS: ${{ steps.pjson.outputs.inject_deps }}
         run: |
           mkdir -p /tmp/ts-parsers
           IFS=',' read -ra DEP_LIST <<< "$DEPS"
@@ -159,10 +260,10 @@ jobs:
           done
 
       - name: Resolve inherited query dependencies
-        if: inputs.inherits != ''
+        if: steps.pjson.outputs.inherits != ''
         shell: bash
         env:
-          INHERITS:   ${{ inputs.inherits }}
+          INHERITS:   ${{ steps.pjson.outputs.inherits }}
           QUERY_DIR:  ${{ steps.queries.outputs.dir }}
         run: |
           mkdir -p /tmp/ts-parsers query-deps
@@ -237,7 +338,7 @@ jobs:
       - name: Write .tsqueryrc.json
         shell: bash
         env:
-          LANG:      ${{ inputs.lang }}
+          LANG:      ${{ steps.pjson.outputs.lang }}
           QUERY_DIR: ${{ steps.queries.outputs.dir }}
         run: |
           # Build a retrieval pattern from the query dir
@@ -270,18 +371,19 @@ jobs:
         run: ./ts_query_ls check "$QUERY_DIR"
 
       - name: Install highlight-assertions
-        if: ${{ hashFiles('tests/highlights/**/*') != '' }}
+        if: ${{ hashFiles(format('{0}/**/*', steps.pjson.outputs.test_dir)) != '' }}
         run: |
           curl -fL https://github.com/nvim-treesitter/highlight-assertions/releases/latest/download/highlight-assertions-x86_64-unknown-linux-gnu.tar.gz \
             | tar -xz -C /tmp
 
       - name: Run highlight tests
-        if: ${{ hashFiles('tests/highlights/**/*') != '' }}
+        if: ${{ hashFiles(format('{0}/**/*', steps.pjson.outputs.test_dir)) != '' }}
         env:
-          LANG: ${{ inputs.lang }}
+          LANG:     ${{ steps.pjson.outputs.lang }}
+          TEST_DIR: ${{ steps.pjson.outputs.test_dir }}
         run: |
           ERRORS=0
-          for FILE in tests/highlights/*; do
+          for FILE in "$TEST_DIR"/*; do
             [ -f "$FILE" ] || continue
             echo "==> $FILE"
             if ! /tmp/highlight-assertions \

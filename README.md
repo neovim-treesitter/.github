@@ -33,3 +33,47 @@ jobs:
 5. Runs `tree-sitter test` if `test/corpus/*.txt` exists
 
 **Requirements** — the calling repo must have a `parser.json` at the root conforming to the [schema](https://github.com/neovim-treesitter/treesitter-parser-registry/blob/main/schemas/schema.json).
+
+---
+
+### `self-contained-validate.yml`
+
+Validates queries and runs highlight assertion tests for **self-contained** parser repos — repos where Neovim queries ship alongside the grammar itself.
+
+**Usage** — add `.github/workflows/nvim-queries.yml` to your parser repo:
+
+```yaml
+name: Validate Queries (Self-Contained)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "nvim-queries/mylang/**"
+      - "tests/**"
+      - "parser.json"
+  pull_request:
+    branches: [main]
+    paths:
+      - "nvim-queries/mylang/**"
+      - "tests/**"
+      - "parser.json"
+  workflow_dispatch:
+
+jobs:
+  validate:
+    uses: neovim-treesitter/.github/.github/workflows/self-contained-validate.yml@main
+```
+
+No `with:` inputs are needed — the workflow reads `parser.json` from the repo root.
+
+**What it does:**
+
+1. Reads `parser.json` for configuration (`lang`, `queries_dir`, `test_dir`, `location`, `inject_deps`, `inherits`)
+2. Builds the parser `.so` from source using `tree-sitter build`
+3. Resolves `; inherits:` query dependencies via BFS
+4. Builds injection dependency parsers if `inject_deps` is specified
+5. Runs `ts_query_ls check` to validate all `.scm` files
+6. Runs highlight assertion tests if `test_dir` is specified and the directory exists
+
+**Requirements** — the calling repo must have a `parser.json` at the root with at least `lang` and one of `queries_dir` or `queries_path`. See the [self-contained migration guide](https://github.com/neovim-treesitter/treesitter-parser-registry/blob/main/docs/self-contained-migration.md) and the [schema](https://github.com/neovim-treesitter/treesitter-parser-registry/blob/main/schemas/schema.json).
