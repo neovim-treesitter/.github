@@ -152,7 +152,7 @@ jobs:
 
           git add parser.json
           git commit -m "fix: bump parser_version to ${LATEST}"
-          git push -u origin "$BRANCH"
+          git push --force-with-lease -u origin "$BRANCH"
 
           printf 'Automated parser version bump for **%s**.\n\n- Previous: `%s`\n- New: `%s`\n\nAll validation checks (query lint, highlight tests, corpus tests) passed\nagainst the new parser version before this PR was created.\n' \
             "$LANG" "${CURRENT:-<none>}" "$LATEST" > /tmp/pr-body.md
